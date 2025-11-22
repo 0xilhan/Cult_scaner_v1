@@ -1,57 +1,54 @@
 import { GoogleGenAI } from "@google/genai";
 import { AnalysisResult, PersonProfile, Source } from "../types";
 
-// Load API key from Vite environment
+// Load API key from .env (Vite rules)
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
-// Helper to extract JSON if the model accidentally wraps it in markdown
+// Extract JSON safely
 const extractJson = (text: string): any => {
   if (!text) return null;
 
-  // Direct JSON?
   try {
     return JSON.parse(text);
-  } catch (e) {}
+  } catch {}
 
-  // ```json ... ```
-  const jsonBlock = text.match(/```json\s*([\s\S]*?)\s*```/);
-  if (jsonBlock && jsonBlock[1]) {
+  const matchJson = text.match(/```json\s*([\s\S]*?)\s*```/);
+  if (matchJson?.[1]) {
     try {
-      return JSON.parse(jsonBlock[1]);
+      return JSON.parse(matchJson[1]);
     } catch {}
   }
 
-  // ``` ... ```
-  const genericBlock = text.match(/```\s*([\s\S]*?)\s*```/);
-  if (genericBlock && genericBlock[1]) {
+  const matchGeneric = text.match(/```\s*([\s\S]*?)\s*```/);
+  if (matchGeneric?.[1]) {
     try {
-      return JSON.parse(genericBlock[1]);
+      return JSON.parse(matchGeneric[1]);
     } catch {}
   }
 
   return null;
 };
 
-// Generate an AI fallback avatar
-const generateCultAvatar = async (
-  role: string,
-  diagnosis: string
-): Promise<string | null> => {
+// Fallback Avatar Generator
+const generateCultAvatar = async (role: string, diagnosis: string) => {
   if (!API_KEY) return null;
 
   const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-  const prompt = `A dark, cyberpunk, high-contrast portrait of a character with the role "${role}". 
-  They have a cult-leader aura as described: ${diagnosis.substring(0, 120)}. 
-  Neon lighting, glitch effects, dystopian atmosphere.`;
+  const prompt = `
+    A dark, cyberpunk portrait of a mysterious character with the role "${role}".
+    Cult-leader aura. Description: ${diagnosis.substring(0, 200)}.
+    Neon lights, glitch effects, futuristic shadows. Portrait format.
+  `;
 
   try {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-image",
-      contents: { parts: [{ text: prompt }] },
+      contents: { parts: [{ text: prompt }] }
     });
 
     const parts = response?.candidates?.[0]?.content?.parts || [];
+
     for (const part of parts) {
       if (part.inlineData?.data) {
         return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
@@ -73,16 +70,17 @@ export const scanProtocol = async (
   const ai = new GoogleGenAI({ apiKey: API_KEY });
 
   const systemPrompt = `
-    You are a ruthless OSINT investigator for the crypto industry.
-    You dig up founder history, team background, red flags, cult-like behavior, and past scandals.
+    You are a ruthless OSINT investigator for crypto.
+    You analyze founders, team backgrounds, red flags, past scams,
+    cult-like behaviors, and suspicious marketing.
 
-    You MUST:
-    - Use Google Search results
-    - Return ONLY JSON (no markdown)
-    - Include profile image URLs when possible
-    - Include social links when possible
+    REQUIREMENTS:
+    - Use Google Search tool results.
+    - Output MUST be PURE JSON. No markdown, no commentary.
+    - Include image URLs if found.
+    - Include socials if found.
 
-    Output must strictly be a JSON object with this format:
+    JSON FORMAT:
     {
       "protocol": "",
       "summary": "",
@@ -107,7 +105,7 @@ export const scanProtocol = async (
     }
   `;
 
-  const userPrompt = `Investigate the crypto protocol: "${protocolName}". Return JSON ONLY.`;
+  const userPrompt = `Investigate the crypto protocol: "${protocolName}". Return ONLY JSON, no markdown.`;
 
   try {
     const response = await ai.models.generateContent({
@@ -115,46 +113,42 @@ export const scanProtocol = async (
       contents: userPrompt,
       config: {
         systemInstruction: systemPrompt,
-        tools: [{ googleSearch: {} }],
+        tools: [{ googleSearch: {} }]
       },
-      // THE IMPORTANT FIX:
-      responseMimeType: "application/json",
+      responseMimeType: "application/json" // Forces pure JSON output
     });
 
-    const raw = response?.text();
+    // The FIX: Google GenAI SDK uses response.output_text
+    const raw = response.output_text;
     if (!raw) throw new Error("Empty response from Gemini");
 
-    const jsonData = extractJson(raw);
-    if (!jsonData) throw new Error("Invalid or missing JSON from Gemini");
+    // Parse JSON
+    const jsonData = extractJson(raw) || JSON.parse(raw);
 
-    // Process profiles
+    // Process Profiles + Avatar fallback
     const processedProfiles = await Promise.all(
-      (jsonData.profiles || []).map(async (profile: PersonProfile) => {
-        let img = profile.imageUrl;
-        const valid =
-          img && (img.startsWith("http") || img.startsWith("data:"));
+      (jsonData.profiles || []).map(async (p: PersonProfile) => {
+        let img = p.imageUrl;
+        const valid = img && (img.startsWith("http") || img.startsWith("data:"));
 
         if (!valid) {
-          const generated = await generateCultAvatar(
-            profile.role,
-            profile.diagnosis
-          );
-          if (generated) img = generated;
+          const gen = await generateCultAvatar(p.role, p.diagnosis);
+          if (gen) img = gen;
         }
 
-        return { ...profile, imageUrl: img };
+        return { ...p, imageUrl: img };
       })
     );
 
-    // Sources from grounding metadata
-    const grounding =
+    // Sources (Google Search grounding)
+    const chunks =
       response?.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
 
-    const sources: Source[] = grounding
+    const sources: Source[] = chunks
       .filter((c: any) => c.web?.uri && c.web?.title)
       .map((c: any) => ({
         uri: c.web.uri,
-        title: c.web.title,
+        title: c.web.title
       }));
 
     const uniqueSources = Array.from(
@@ -163,9 +157,9 @@ export const scanProtocol = async (
 
     return {
       protocol: jsonData.protocol || protocolName,
-      summary: jsonData.summary || "No summary available",
+      summary: jsonData.summary || "No summary provided.",
       profiles: processedProfiles,
-      sources: uniqueSources,
+      sources: uniqueSources
     };
   } catch (err) {
     console.error("SCAN ERROR:", err);
